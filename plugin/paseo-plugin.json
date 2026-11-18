@@ -1,6 +1,7 @@
 {
   "id": "paseo-cafe",
   "icon": "images/icon.png",
+  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]],
   "requirements": {
     "paseo": ">=0.11.0"
   }
