@@ -1,4 +1,4 @@
-import { useRpc, useSettings } from "@getpaseo/plugin/client"
+import { usePaseo, useRpc, useSettings } from "@getpaseo/plugin/client"
 import { useToast } from "@getpaseo/plugin/client/react-native"
 import type { SettingsInputHandle } from "@getpaseo/plugin/client/ui"
 import {
@@ -7,7 +7,9 @@ import {
   SettingsInput,
   SettingsRow,
   SettingsSection,
+  SettingsSelect,
 } from "@getpaseo/plugin/client/ui"
+import { useQuery } from "@tanstack/react-query"
 import { useRef, useState } from "react"
 import {
   DEFAULT_REGISTRY_URL,
@@ -23,6 +25,23 @@ const REGISTRY_INFO =
 
 export function DirectorySettings() {
   const settings = useSettings(directorySettings)
+  const paseo = usePaseo()
+  const reviewModels = useQuery({
+    queryKey: ["codex-review-models"],
+    enabled: settings.status === "ready",
+    queryFn: async () => {
+      const { models, error } = await paseo.providers.listModels("codex")
+      if (error) throw new Error(error)
+      return (models ?? []).flatMap(({ id, label, isSelectable }) => {
+        const value = `codex/${id}`
+        return isSelectable !== false &&
+          /^codex\/\S+$/.test(value) &&
+          value.length <= 200
+          ? [{ value, label }]
+          : []
+      })
+    },
+  })
   const runAutomaticUpdates = useRpc(directoryRunAutomaticUpdatesRpc)
   const toast = useToast()
   const [draft, setDraft] = useState<string | null>(null)
@@ -55,6 +74,17 @@ export function DirectorySettings() {
   // `settings.status === "ready"` narrowing into a closure defined below, but
   // these individual bindings keep their (already-narrowed) types fine.
   const { values, revision, saving, saveError, save: saveSettings } = settings
+  const modelOptions = reviewModels.data ?? []
+  const reviewOptions = [{ value: "", label: "None" }, ...modelOptions]
+  if (
+    values.reviewProvider &&
+    !reviewOptions.some(({ value }) => value === values.reviewProvider)
+  ) {
+    reviewOptions.push({
+      value: values.reviewProvider,
+      label: values.reviewProvider,
+    })
+  }
   const currentUrl = draft ?? values.registryUrl
   const urlValid = isTrustedRegistryUrl(currentUrl)
   const dirty = registryBase(currentUrl) !== registryBase(values.registryUrl)
@@ -72,6 +102,13 @@ export function DirectorySettings() {
     } else {
       toast.error("Failed to save Paseo Cafe settings.")
     }
+  }
+
+  async function saveReviewModel(reviewProvider: string) {
+    if (reviewProvider === values.reviewProvider) return
+    const ok = await saveSettings({ ...values, reviewProvider }, revision)
+    if (ok) toast.show("Security review model saved.", { variant: "success" })
+    else toast.error("Failed to save the security review model.")
   }
 
   function reset() {
@@ -125,6 +162,31 @@ export function DirectorySettings() {
           disabled={saving || usingOfficialRegistry}
           onPress={reset}
         />
+        <SettingsSelect
+          label="Security review model"
+          hint="Codex receives candidate plugin contents for review. Without a model, no review runs and installs and updates are blocked."
+          error={saveError}
+          value={values.reviewProvider}
+          options={reviewOptions}
+          disabled={
+            saving || (modelOptions.length === 0 && !values.reviewProvider)
+          }
+          onValueChange={(model) => void saveReviewModel(model)}
+        />
+        {reviewModels.isFetching && modelOptions.length === 0 ? (
+          <SettingsRow label="Loading Codex models…" />
+        ) : reviewModels.isError || modelOptions.length === 0 ? (
+          <SettingsAction
+            label={
+              reviewModels.isError
+                ? "Could not load Codex models"
+                : "No Codex models available on this host"
+            }
+            error={reviewModels.error?.message}
+            actionLabel="Retry"
+            onPress={() => void reviewModels.refetch()}
+          />
+        ) : null}
         <SettingsAction
           label="Run automatic updates now"
           hint="Installed plugins update on their own every 6 hours unless automatic updates are off for them. Run the check now instead of waiting."
