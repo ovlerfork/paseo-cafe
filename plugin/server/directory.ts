@@ -1,6 +1,11 @@
 import { execFile, spawn } from "node:child_process"
-import { createHash } from "node:crypto"
-import { promisify } from "node:util"
+import { createHash, randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { join } from "node:path"
+import { isDeepStrictEqual, promisify } from "node:util"
+import { createPaseoApi } from "@getpaseo/client"
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client"
+import { createHostClient } from "@getpaseo/client/node"
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin"
 import { z } from "zod"
 import type {
@@ -15,6 +20,7 @@ import type {
   PluginUpdate,
 } from "../shared/directory"
 import {
+  artifactSchema,
   DEFAULT_REGISTRY_URL,
   DETAIL_README_MAX,
   type DirectoryEntry,
@@ -33,6 +39,8 @@ import {
   SELF_INSTALLATION_ID,
   sameArtifact,
 } from "../shared/directory"
+import { stagePluginCandidate } from "./candidate-staging"
+import { reviewPluginCandidate } from "./security-review"
 import { isVersionAtLeast } from "./semver"
 
 const execFileAsync = promisify(execFile)
@@ -503,10 +511,152 @@ export async function listDirectoryUpdateStatus(
 // ---------------------------------------------------------------------------
 // Install and update
 
+type Candidate = Parameters<typeof stagePluginCandidate>[0]
+type ReviewCandidate = (candidate: Candidate) => Promise<void>
+type UpdateClient = Pick<
+  DaemonClient,
+  "previewPluginUpdates" | "applyPluginUpdates"
+>
+
+interface ReviewSession {
+  review: ReviewCandidate
+  client: UpdateClient
+}
+
+type OpenReviewSession = <Result>(
+  operation: (session: ReviewSession) => Promise<Result>
+) => Promise<Result>
+
+export function openDirectoryReviewSession(
+  readProvider: () => Promise<string | undefined>,
+  signal?: AbortSignal
+): OpenReviewSession {
+  return async (operation) => {
+    const provider = await readProvider()
+    if (!provider || !/^codex\/\S+$/.test(provider)) {
+      throw new Error(
+        "Select a Codex model for security review in Paseo Cafe settings."
+      )
+    }
+    if (signal?.aborted) throw new Error("Plugin security review was canceled.")
+    const { stdout } = await execPaseo(
+      ["daemon", "status", "--json"],
+      30_000,
+      signal
+    )
+    const { home, listen, serverId } = z
+      .object({
+        home: z.string().min(1),
+        listen: z.string().min(1),
+        serverId: z.string().min(1),
+      })
+      .parse(JSON.parse(stdout))
+    const client = createHostClient(listen, {
+      clientId: randomUUID(),
+      clientType: "cli",
+      password: process.env.PASEO_PASSWORD,
+      localCredential: async () => {
+        const token = await readFile(
+          join(home, "local-credential"),
+          "utf8"
+        ).catch(() => "")
+        const trimmed = token.trim()
+        return /^[A-Za-z0-9_-]{43}$/.test(trimmed) ? trimmed : undefined
+      },
+      connectTimeoutMs: 15_000,
+      reconnect: { enabled: false },
+    })
+    try {
+      await client.connect()
+      if (client.getLastServerInfoMessage()?.serverId !== serverId) {
+        throw new Error(
+          "Could not identify the local Paseo daemon for security review."
+        )
+      }
+      const paseo = createPaseoApi(client, { signal })
+      return await operation({
+        client,
+        review: async (candidate) => {
+          if (signal?.aborted)
+            throw new Error("Plugin security review was canceled.")
+          const staged = await stagePluginCandidate(candidate)
+          try {
+            const verdict = await reviewPluginCandidate(paseo, {
+              provider,
+              ...staged,
+            })
+            if (!verdict.approved)
+              throw new Error(
+                `Security review blocked this plugin: ${verdict.reason}`
+              )
+          } finally {
+            await staged.cleanup()
+          }
+          if ((await readProvider()) !== provider) {
+            throw new Error("Security review settings changed. Try again.")
+          }
+          if (signal?.aborted)
+            throw new Error("Plugin security review was canceled.")
+        },
+      })
+    } finally {
+      await client.close()
+    }
+  }
+}
+
+const unconfiguredReview = openDirectoryReviewSession(async () => undefined)
+
+function samePin(
+  left: Candidate["artifact"],
+  right: Candidate["artifact"]
+): boolean {
+  return (
+    sameArtifact(left, right) &&
+    (left.kind !== "npm" ||
+      right.kind !== "npm" ||
+      left.resolved === right.resolved)
+  )
+}
+
+function sameCandidate(left: Candidate, right: Candidate): boolean {
+  return (
+    samePin(left.artifact, right.artifact) &&
+    left.pluginPath === right.pluginPath &&
+    left.repository.url === right.repository.url &&
+    left.repository.commit === right.repository.commit
+  )
+}
+
+async function findRegistryEntry(
+  base: string,
+  id: string
+): Promise<DirectoryEntry | undefined> {
+  const { plugins } = await fetchRegistry(base, true)
+  const entries = plugins.filter((entry) => entry.id === id)
+  if (entries.length > 1)
+    throw new Error(`The registry lists ${id} more than once.`)
+  return entries[0]
+}
+
+const registryPinSchema = z.object({
+  id: z.string().regex(REGISTRY_ID_PATTERN),
+  artifact: artifactSchema,
+})
+
+async function readRegistryPin(base: string, id: string) {
+  const pin = registryPinSchema.parse(
+    await fetchRegistryJson(`${base}/plugins/${id}.json`)
+  )
+  if (pin.id !== id) throw new Error(`Registry returned ${pin.id} for ${id}`)
+  return pin.artifact
+}
+
 export async function installDirectoryPlugin(
   input: RpcInput<typeof directoryInstallRpc>,
   registryUrl: string | undefined = input.registryUrl,
-  supportsInstall: () => Promise<boolean> = probeRegistryInstall
+  supportsInstall: () => Promise<boolean> = probeRegistryInstall,
+  openReview: OpenReviewSession = unconfiguredReview
 ): Promise<RpcOutput<typeof directoryInstallRpc>> {
   if (!(await supportsInstall())) {
     return {
@@ -514,33 +664,40 @@ export async function installDirectoryPlugin(
       message: `Installing from the directory needs Paseo ${MIN_REGISTRY_INSTALL_VERSION} or later on the daemon. Update Paseo, then try again.`,
     }
   }
-  const base = resolveRegistryBase(registryUrl)
-  const source = getInstallSource(base, input.id)
-  if (source === undefined) {
-    return {
-      ok: false,
-      message: `The daemon can only install from this registry if it is the default registry or served from a host root over HTTPS. Set PASEO_PLUGIN_REGISTRY=${base} on the daemon and install ${input.id} from the CLI.`,
-    }
-  }
-  // The user reviewed one artifact; refuse if the registry pin moved since.
-  const { plugins } = await fetchRegistry(base, true)
-  const entry = plugins.find((candidate) => candidate.id === input.id)
-  if (!entry) {
-    return {
-      ok: false,
-      message: `${input.id} is no longer listed in this registry.`,
-    }
-  }
-  if (!sameArtifact(entry.artifact, input.expected)) {
-    return {
-      ok: false,
-      message: `${input.id} changed in the registry since you reviewed it. Refresh the directory and review it again.`,
-    }
-  }
   try {
-    await execPaseo(["plugin", "add", source, "--json"], 180_000)
-    updateStatusCache = undefined
-    return { ok: true, message: `Installed ${input.id}.` }
+    const base = resolveRegistryBase(registryUrl)
+    if (getInstallSource(base, input.id) === undefined) {
+      throw new Error(
+        `The daemon can only install from this registry if it is the default registry or served from a host root over HTTPS. Set PASEO_PLUGIN_REGISTRY=${base} on the daemon and install ${input.id} from the CLI.`
+      )
+    }
+    const entry = await findRegistryEntry(base, input.id)
+    if (!entry)
+      throw new Error(`${input.id} is no longer listed in this registry.`)
+    const changed = `${input.id} changed in the registry since you reviewed it. Refresh the directory and review it again.`
+    if (
+      !samePin(entry.artifact, input.expected) ||
+      !samePin(entry.artifact, await readRegistryPin(base, input.id))
+    ) {
+      throw new Error(changed)
+    }
+    return await openReview(async ({ review }) => {
+      await review(entry)
+      const latest = await findRegistryEntry(base, input.id)
+      if (
+        !latest ||
+        !sameCandidate(entry, latest) ||
+        !samePin(entry.artifact, await readRegistryPin(base, input.id))
+      )
+        throw new Error(changed)
+      // A qualified source cannot resolve against a different daemon default registry.
+      await execPaseo(
+        ["plugin", "add", `${new URL(base).host}/${input.id}`, "--json"],
+        180_000
+      )
+      updateStatusCache = undefined
+      return { ok: true, message: `Installed ${input.id}.` }
+    })
   } catch (error) {
     return { ok: false, message: commandFailureMessage(error) }
   }
@@ -614,36 +771,125 @@ export async function serializePluginUpdate<Result>(
   }
 }
 
+type UpdateProposal = Awaited<
+  ReturnType<UpdateClient["previewPluginUpdates"]>
+>[number]["proposal"]
+
+async function candidateForUpdate(
+  proposal: NonNullable<UpdateProposal>
+): Promise<Candidate> {
+  const {
+    target,
+    expected: { identity },
+  } = proposal
+  if (identity.kind === "directory" || identity.kind !== target.kind) {
+    throw new Error("Cannot verify the proposed plugin source.")
+  }
+  const artifact = artifactSchema.parse(
+    target.kind === "git" && identity.kind === "git"
+      ? { ...target, remote: identity.remote, pluginPath: identity.pluginPath }
+      : {
+          ...target,
+          package: identity.kind === "npm" ? identity.packageName : undefined,
+        }
+  )
+  const registry = identity.registry
+  if (registry) {
+    const entry = await findRegistryEntry(
+      resolveRegistryBase(registry.url),
+      registry.id
+    )
+    if (!entry || !samePin(entry.artifact, artifact)) {
+      throw new Error(
+        "The registry artifact does not match the proposed plugin update."
+      )
+    }
+    return entry
+  }
+  return {
+    artifact,
+    ...(identity.kind === "npm" && identity.pluginPath !== "."
+      ? { pluginPath: identity.pluginPath }
+      : {}),
+    repository:
+      artifact.kind === "git"
+        ? { url: artifact.remote, commit: artifact.commit }
+        : { url: "" },
+  }
+}
+
 export async function updateDirectoryPlugin(
   input: RpcInput<typeof directoryUpdateRpc>,
   startUpdate: (args: readonly string[]) => Promise<void> = startDetachedPaseo,
-  runPaseo: typeof execPaseo = execPaseo
+  openReview: OpenReviewSession = unconfiguredReview,
+  canApply: () => Promise<boolean> = async () => true
 ): Promise<RpcOutput<typeof directoryUpdateRpc>> {
-  const args = ["plugin", "update", input.installationId, "--yes", "--json"]
-  return serializePluginUpdate(input.installationId, async () => {
-    updateStatusCache = undefined
-    // This plugin's own process is stopped by its update, so the result cannot
-    // be awaited: run the CLI detached and let the surface reconnect.
-    if (input.installationId === SELF_INSTALLATION_ID) {
-      try {
-        await startUpdate(args)
-      } catch (error) {
-        return { ok: false, message: commandFailureMessage(error) }
-      }
-      return {
-        ok: true,
-        restarting: true,
-        message: "Updating Paseo Cafe. It restarts when the update finishes.",
-      }
-    }
+  const id = input.installationId
+  return serializePluginUpdate(id, async () => {
     try {
-      const { stdout } = await runPaseo(args, 120_000)
-      return parseUpdateResult(stdout, input.installationId)
+      return await openReview(async ({ client, review }) => {
+        const [preview] = await client.previewPluginUpdates({ pluginId: id })
+        if (!preview || preview.id !== id || preview.outcome !== "update") {
+          return parseUpdateResult(
+            JSON.stringify(preview?.id === id ? [preview] : []),
+            id
+          )
+        }
+        const proposal = preview.proposal
+        if (!proposal || proposal.id !== id) {
+          throw new Error("Could not verify the proposed plugin update.")
+        }
+        const candidate = await candidateForUpdate(proposal)
+        await review(candidate)
+        const target =
+          proposal.target.kind === "git"
+            ? { kind: "git" as const, ref: proposal.target.commit }
+            : { kind: "npm" as const, version: proposal.target.version }
+        const useExplicitTarget =
+          id === SELF_INSTALLATION_ID &&
+          proposal.expected.identity.kind !== "directory" &&
+          !proposal.expected.identity.registry
+        const [latest] = await client.previewPluginUpdates({
+          pluginId: id,
+          ...(useExplicitTarget ? { target } : {}),
+        })
+        if (
+          latest?.id !== id ||
+          latest.outcome !== "update" ||
+          !isDeepStrictEqual(latest.proposal, proposal) ||
+          !sameCandidate(candidate, await candidateForUpdate(proposal))
+        ) {
+          throw new Error(
+            "The proposed plugin update changed during security review. Try again."
+          )
+        }
+        if (!(await canApply()))
+          throw new Error("Automatic updates are off for this plugin.")
+        updateStatusCache = undefined
+        if (id === SELF_INSTALLATION_ID) {
+          const pin = !useExplicitTarget
+            ? ["--yes"]
+            : target.kind === "git"
+              ? ["--ref", target.ref]
+              : ["--version", target.version]
+          await startUpdate(["plugin", "update", id, ...pin, "--json"])
+          return {
+            ok: true,
+            restarting: true,
+            message:
+              "Updating Paseo Cafe. It restarts when the update finishes.",
+          }
+        }
+        const results = await client.applyPluginUpdates([proposal])
+        return parseUpdateResult(JSON.stringify(results), id)
+      })
     } catch (error) {
       return { ok: false, message: commandFailureMessage(error) }
     }
   })
 }
+
+export const fetchAutomaticUpdateStatus = () => fetchUpdateStatus(true)
 
 export interface AutomaticUpdateSettings {
   autoUpdateOptOuts: readonly string[]
@@ -651,7 +897,9 @@ export interface AutomaticUpdateSettings {
 
 interface AutomaticUpdateDependencies {
   fetchStatus: () => Promise<PluginUpdate[]>
-  update: typeof updateDirectoryPlugin
+  update: (
+    input: RpcInput<typeof directoryUpdateRpc>
+  ) => Promise<RpcOutput<typeof directoryUpdateRpc>>
 }
 
 let automaticUpdateRun:
@@ -662,7 +910,7 @@ let automaticUpdateRun:
 export function runAutomaticPluginUpdates(
   readSettings: () => Promise<AutomaticUpdateSettings | undefined>,
   dependencies: AutomaticUpdateDependencies = {
-    fetchStatus: () => fetchUpdateStatus(true),
+    fetchStatus: fetchAutomaticUpdateStatus,
     update: updateDirectoryPlugin,
   },
   signal?: AbortSignal

@@ -391,6 +391,7 @@ describe("settings", () => {
     expect(parsed).toEqual({
       registryUrl: DEFAULT_REGISTRY_URL,
       autoUpdateOptOuts: ["review"],
+      reviewProvider: "",
       browse: {
         query: "theme",
         categories: [],

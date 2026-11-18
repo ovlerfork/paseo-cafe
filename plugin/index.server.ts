@@ -1,9 +1,11 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server"
 import {
+  fetchAutomaticUpdateStatus,
   getDirectoryDetail,
   installDirectoryPlugin,
   listDirectory,
   listDirectoryUpdateStatus,
+  openDirectoryReviewSession,
   runAutomaticPluginUpdates,
   searchDirectory,
   updateDirectoryPlugin,
@@ -22,6 +24,7 @@ import {
 interface DirectorySettingsValues {
   registryUrl: string
   autoUpdateOptOuts?: string[]
+  reviewProvider?: string
 }
 interface DirectorySettingsReader {
   read(): Promise<
@@ -63,10 +66,24 @@ export default function contribute(
     if (!current || disposed) return undefined
     return { autoUpdateOptOuts: current.autoUpdateOptOuts ?? [] }
   }
+  const openReview = openDirectoryReviewSession(
+    async () => (await readDirectorySettings(settings))?.reviewProvider,
+    automaticUpdateAbort.signal
+  )
   const runAutomaticUpdates = () =>
     dependencies.run(
       readAutomaticUpdateSettings,
-      undefined,
+      {
+        fetchStatus: fetchAutomaticUpdateStatus,
+        update: (input) =>
+          updateDirectoryPlugin(input, undefined, openReview, async () => {
+            const current = await readAutomaticUpdateSettings()
+            return (
+              !!current &&
+              !current.autoUpdateOptOuts.includes(input.installationId)
+            )
+          }),
+      },
       automaticUpdateAbort.signal
     )
 
@@ -87,8 +104,12 @@ export default function contribute(
   server.handle(directorySearchRpc, async (input) =>
     searchDirectory(input, await registryUrl())
   )
-  server.handle(directoryInstallRpc, (input) => installDirectoryPlugin(input))
-  server.handle(directoryUpdateRpc, (input) => updateDirectoryPlugin(input))
+  server.handle(directoryInstallRpc, (input) =>
+    installDirectoryPlugin(input, undefined, undefined, openReview)
+  )
+  server.handle(directoryUpdateRpc, (input) =>
+    updateDirectoryPlugin(input, undefined, openReview)
+  )
   return () => {
     disposed = true
     automaticUpdateAbort.abort()

@@ -21,6 +21,7 @@
     "zod": "^4.4.3"
   },
   "dependencies": {
+    "@getpaseo/client": "0.15.0",
     "tar-stream": "^3.2.2"
   }
 }

@@ -267,6 +267,7 @@ export const directorySettings = defineSettings({
       DEFAULT_DIRECTORY_BROWSE_SETTINGS
     ),
     autoUpdateOptOuts: z.array(installationIdSchema).max(500).default([]),
+    reviewProvider: z.string().max(200).default(""),
   }),
   migrate: migrateDirectorySettings,
 })

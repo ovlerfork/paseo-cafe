@@ -267,7 +267,8 @@ async function stagePublished(
 export async function stagePluginCandidate({
   artifact,
   repository,
-}: Pick<DirectoryEntry, "artifact" | "repository">) {
+  pluginPath,
+}: Pick<DirectoryEntry, "artifact" | "repository"> & { pluginPath?: string }) {
   const root = await mkdtemp(join(tmpdir(), "paseo-plugin-review-"))
   const cleanup = () => rm(root, { recursive: true, force: true })
   try {
@@ -299,7 +300,11 @@ export async function stagePluginCandidate({
     }
     await writeFile(
       join(repositoryPath, "candidate.json"),
-      JSON.stringify({ artifact, repository, sourceCommit }, null, 2)
+      JSON.stringify(
+        { artifact, repository, sourceCommit, pluginPath },
+        null,
+        2
+      )
     )
     await git(repositoryPath, "init", "--template=", "--initial-branch=main")
     await git(repositoryPath, "add", "--", ".")

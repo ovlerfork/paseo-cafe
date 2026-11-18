@@ -11,6 +11,7 @@ import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { promisify } from "node:util"
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const executeFileAsync = promisify(executeFile)
@@ -473,6 +474,45 @@ describe("installed plugin and update inventory", () => {
   })
 })
 
+type UpdateClient = Pick<
+  DaemonClient,
+  "previewPluginUpdates" | "applyPluginUpdates"
+>
+type Preview = Awaited<ReturnType<UpdateClient["previewPluginUpdates"]>>[number]
+
+function updatePreview(id: string, version = "2.0.0"): Preview {
+  const target = {
+    kind: "npm" as const,
+    version,
+    resolved: "https://registry.npmjs.org/example.tgz",
+    integrity: INTEGRITY,
+  }
+  return {
+    id,
+    outcome: "update",
+    links: [],
+    target,
+    proposal: {
+      id,
+      expected: {
+        installationRoot: "/plugins/example",
+        revision: "1.0.0",
+        identity: { kind: "npm", packageName: "example", pluginPath: "." },
+      },
+      target,
+    },
+  }
+}
+
+function reviewSession(client: UpdateClient, review = vi.fn(async () => {})) {
+  return <T>(
+    operation: (session: {
+      client: UpdateClient
+      review: typeof review
+    }) => Promise<T>
+  ) => operation({ client, review })
+}
+
 describe("registry install", () => {
   it("recognizes daemons that can resolve owner/slug", () => {
     expect(supportsRegistryInstall("0.11.0-beta.3\n")).toBe(false)
@@ -546,7 +586,33 @@ describe("registry install", () => {
     })
   })
 
-  it("installs the reviewed listing by registry id and nothing else", async () => {
+  it("refuses to install if the daemon's detail pin changes during review", async () => {
+    let version = "1.0.0"
+    globalThis.fetch = vi.fn<typeof fetch>(async (url) =>
+      Response.json(
+        String(url).endsWith("/index.json")
+          ? index([entry()])
+          : entry({ artifact: npmArtifact(version) })
+      )
+    )
+    const result = await installDirectoryPlugin(
+      { id: "acme/example", expected: npmArtifact() },
+      undefined,
+      async () => true,
+      reviewSession(
+        { previewPluginUpdates: vi.fn(), applyPluginUpdates: vi.fn() },
+        vi.fn(async () => {
+          version = "2.0.0"
+        })
+      )
+    )
+    expect(result).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("changed in the registry"),
+    })
+  })
+
+  it("installs the approved listing by qualified registry id", async () => {
     const root = await mkdtemp(join(tmpdir(), "paseo-install-"))
     const log = join(root, "argv.json")
     const isWindows = process.platform === "win32"
@@ -571,21 +637,27 @@ describe("registry install", () => {
       if (!isWindows) await chmod(shim, 0o755)
       process.env.PATH = `${root}${delimiter}${originalPath ?? ""}`
       process.env.PASEO_TEST_ARGV_LOG = log
-      globalThis.fetch = vi.fn(async () =>
-        Response.json(index([entry()]))
-      ) as typeof fetch
+      globalThis.fetch = vi.fn<typeof fetch>(async (url) =>
+        Response.json(
+          String(url).endsWith("/index.json") ? index([entry()]) : entry()
+        )
+      )
 
       const result = await installDirectoryPlugin(
         { id: "acme/example", expected: npmArtifact() },
         undefined,
-        async () => true
+        async () => true,
+        reviewSession({
+          previewPluginUpdates: vi.fn(),
+          applyPluginUpdates: vi.fn(),
+        })
       )
 
       expect(result).toEqual({ ok: true, message: "Installed acme/example." })
       expect(JSON.parse(await readFile(log, "utf8"))).toEqual([
         "plugin",
         "add",
-        "acme/example",
+        "plugins.paseo.sh/acme/example",
         "--json",
       ])
     } finally {
@@ -643,65 +715,90 @@ describe("update status", () => {
 })
 
 describe("updateDirectoryPlugin", () => {
-  it("runs the CLI and reports the outcome for an ordinary plugin", async () => {
-    const runPaseo = vi.fn(async () => ({
-      stdout: JSON.stringify([{ id: "example", outcome: "updated" }]),
-      stderr: "",
-    }))
-
+  it("reviews and applies the exact proposed artifact", async () => {
+    const preview = updatePreview("example")
+    const review = vi.fn(async () => {})
+    const client = {
+      previewPluginUpdates: vi.fn(async () => [preview]),
+      applyPluginUpdates: vi.fn<UpdateClient["applyPluginUpdates"]>(
+        async () => [{ id: "example", outcome: "updated" }]
+      ),
+    }
     const result = await updateDirectoryPlugin(
       { installationId: "example" },
       vi.fn(),
-      runPaseo as unknown as typeof execPaseo
+      reviewSession(client, review)
     )
-
-    expect(runPaseo).toHaveBeenCalledWith(
-      ["plugin", "update", "example", "--yes", "--json"],
-      120_000
-    )
-    expect(result).toEqual({
-      ok: true,
-      updated: true,
-      message: "Updated example.",
+    expect(review).toHaveBeenCalledWith({
+      artifact: { ...preview.target, package: "example" },
+      repository: { url: "" },
     })
+    expect(client.applyPluginUpdates).toHaveBeenCalledWith([preview.proposal])
+    expect(result).toMatchObject({ ok: true, updated: true })
   })
 
-  it("hands this plugin's own update to a detached process", async () => {
-    const startUpdate = vi.fn(async () => {})
-    const runPaseo = vi.fn()
+  it("blocks updates when review fails or the update pin changes", async () => {
+    for (const rejected of [false, true]) {
+      const client = {
+        previewPluginUpdates: vi
+          .fn<UpdateClient["previewPluginUpdates"]>()
+          .mockResolvedValueOnce([updatePreview("example")])
+          .mockResolvedValueOnce([updatePreview("example", "3.0.0")]),
+        applyPluginUpdates: vi.fn(),
+      }
+      const result = await updateDirectoryPlugin(
+        { installationId: "example" },
+        vi.fn(),
+        reviewSession(
+          client,
+          vi.fn(async () => {
+            if (rejected)
+              throw new Error("Security review blocked this plugin.")
+          })
+        )
+      )
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain(
+        rejected ? "Security review blocked" : "changed during security review"
+      )
+      expect(client.applyPluginUpdates).not.toHaveBeenCalled()
+    }
+  })
 
+  it("hands this plugin's reviewed update to a detached process", async () => {
+    const startUpdate = vi.fn(async () => {})
+    const client = {
+      previewPluginUpdates: vi.fn(async () => [updatePreview("paseo-cafe")]),
+      applyPluginUpdates: vi.fn(),
+    }
     const result = await updateDirectoryPlugin(
       { installationId: "paseo-cafe" },
       startUpdate,
-      runPaseo as unknown as typeof execPaseo
+      reviewSession(client)
     )
-
     expect(startUpdate).toHaveBeenCalledWith([
       "plugin",
       "update",
       "paseo-cafe",
-      "--yes",
+      "--version",
+      "2.0.0",
       "--json",
     ])
-    expect(runPaseo).not.toHaveBeenCalled()
+    expect(client.applyPluginUpdates).not.toHaveBeenCalled()
     expect(result).toMatchObject({ ok: true, restarting: true })
   })
 
-  it("reports a CLI failure instead of throwing", async () => {
-    const runPaseo = vi.fn(async () => {
-      throw Object.assign(new Error("Command failed"), {
-        stderr: "network unreachable",
-      })
-    })
-
+  it("fails closed when no review model is configured", async () => {
+    const startUpdate = vi.fn()
     const result = await updateDirectoryPlugin(
-      { installationId: "example" },
-      vi.fn(),
-      runPaseo as unknown as typeof execPaseo
+      { installationId: "paseo-cafe" },
+      startUpdate
     )
-
-    expect(result.ok).toBe(false)
-    expect(result.message).toContain("network unreachable")
+    expect(result).toMatchObject({
+      ok: false,
+      message: expect.stringContaining("Select a Codex model"),
+    })
+    expect(startUpdate).not.toHaveBeenCalled()
   })
 
   it("classifies every CLI update outcome", () => {
